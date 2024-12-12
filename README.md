@@ -19,6 +19,36 @@ VkImageTiling 图像内侧的布局方式
 ------
 ![alt text](renderings/image.png)
 
+ glDispatchCompute 和 vkCmdDispatch调用计算着色器时，需要指定x，y，z三个维度的大小，即上面大长方体（全局工作组）的大小。
+![alt text](/images/computershader.png)
+
+
+![alt text](/images/computershader2.png)
+
+一些内建变量
+------
+ gl_LocalInvocationID：是赋值着色器运行的硬件单元在工作组中的索引，它是一个uvec3类型的变量，每个元素的取值范围分布从0到之前在着色器中声明的本地工作组大小local_size_x-1、local_size_y-1和local_size_z-1；
+
+gl_WorkGroupSize：表示小长方体的大小，即为（local_size_x，local_size_y, local_size_z ）;
+
+gl_NumWorkGroups：表示本地工作组的大小，即小长方体的个数
+
+gl_WorkGroupID：表示小长方体在大长方体的的索引值，从0开始
+
+gl_GlobalInvocationID：在全局工作组中，当前运行的硬件着色器所在位置，为一uvec3变量。
+gl_LocalInvocationIndex：为gl_GlobalInvocationID的扁平化，即将3位坐标投影到一维上。
+————————————————
+
+gl_GlobalInvocationID = gl_WorkGroupID * gl_WorkGroupSize + gl_LocalInvocationID;
+ 
+gl_LocalInvocationIndex =
+    gl_LocalInvocationID.z * gl_WorkGroupSize.x * gl_WorkGroupSize.y + 
+    gl_LocalInvocationID.y * gl_WorkGroupSize.x + 
+    gl_LocalInvocationID.x;
+————————————————
+
+
+
 Vulkan tutorial
 ===============
 
