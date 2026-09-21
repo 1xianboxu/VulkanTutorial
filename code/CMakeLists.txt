@@ -14,6 +14,19 @@ add_subdirectory(${CMAKE_SOURCE_DIR}/includes/glm)
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake/")
 link_directories(${CMAKE_SOURCE_DIR}/lib)
 
+# Vulkan SDK 未注册到环境变量时，在常见安装位置回退查找（取版本号最大的一个）
+if(NOT DEFINED ENV{VULKAN_SDK})
+  file(GLOB VULKAN_SDK_ROOTS LIST_DIRECTORIES true
+    "C:/VulkanSDK/*" "D:/VulkanSDK/*" "E:/VulkanSDK/*" "E:/Software/VulkanSDK/*")
+  if(VULKAN_SDK_ROOTS)
+    list(SORT VULKAN_SDK_ROOTS)
+    list(REVERSE VULKAN_SDK_ROOTS)
+    list(GET VULKAN_SDK_ROOTS 0 VULKAN_SDK_LOCAL)
+    set(ENV{VULKAN_SDK} "${VULKAN_SDK_LOCAL}")
+    message(STATUS "VULKAN_SDK env not set, falling back to ${VULKAN_SDK_LOCAL}")
+  endif()
+endif()
+
 find_package(glfw3 REQUIRED)
 message(STATUS "glfw3 included at ${GLFW3_INCLUDE_DIR}")
 find_package(glm REQUIRED)
@@ -33,31 +46,46 @@ function(add_shaders_target TARGET)
     OUTPUT ${SHADERS_DIR}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADERS_DIR}
   )
-  set(SHADERS ${SHADERS_DIR}/frag.spv ${SHADERS_DIR}/vert.spv)
+  # 计算着色器与图形着色器分开编译：一次调用链接所有 stage 时，
+  # 不同 stage 的 push_constant 块必须一致；分开编译则无此限制
+  set(GRAPHICS_SOURCES ${SHADER_SOURCES})
+  list(FILTER GRAPHICS_SOURCES EXCLUDE REGEX "\\.comp$")
+  set(COMPUTE_SOURCES ${SHADER_SOURCES})
+  list(FILTER COMPUTE_SOURCES INCLUDE REGEX "\\.comp$")
 
-  # Some chapters may have compute shaders in addition to vertex and fragment shaders,
-  # so we conditionally check this and add them to the target
-  string(FIND "${SHADER_SOURCES}" "${CHAPTER_SHADER}.comp" COMPUTE_SHADER_INDEX)
-
-  if(${COMPUTE_SHADER_INDEX} GREATER -1)
-    set(SHADERS ${SHADERS} ${SHADERS_DIR}/comp.spv)
+  set(SHADERS)
+  if(GRAPHICS_SOURCES)
+    set(SHADERS ${SHADERS} ${SHADERS_DIR}/frag.spv ${SHADERS_DIR}/vert.spv)
+    add_custom_command(
+      OUTPUT ${SHADERS_DIR}/frag.spv ${SHADERS_DIR}/vert.spv
+      COMMAND glslang::validator
+      ARGS --target-env vulkan1.0 ${GRAPHICS_SOURCES} --quiet
+      WORKING_DIRECTORY ${SHADERS_DIR}
+      DEPENDS ${SHADERS_DIR} ${GRAPHICS_SOURCES}
+      COMMENT "Compiling graphics shaders"
+      VERBATIM
+    )
   endif()
 
-  add_custom_command(
-    OUTPUT ${SHADERS}
-    COMMAND glslang::validator
-    ARGS --target-env vulkan1.0 ${SHADER_SOURCES} --quiet
-    WORKING_DIRECTORY ${SHADERS_DIR}
-    DEPENDS ${SHADERS_DIR} ${SHADER_SOURCES}
-    COMMENT "Compiling Shaders"
-    VERBATIM
-  )
+  if(COMPUTE_SOURCES)
+    set(SHADERS ${SHADERS} ${SHADERS_DIR}/comp.spv)
+    add_custom_command(
+      OUTPUT ${SHADERS_DIR}/comp.spv
+      COMMAND glslang::validator
+      ARGS --target-env vulkan1.0 ${COMPUTE_SOURCES} --quiet
+      WORKING_DIRECTORY ${SHADERS_DIR}
+      DEPENDS ${SHADERS_DIR} ${COMPUTE_SOURCES}
+      COMMENT "Compiling compute shader"
+      VERBATIM
+    )
+  endif()
+
   add_custom_target(${TARGET} DEPENDS ${SHADERS})
 endfunction()
 
 function(add_chapter CHAPTER_NAME)
   message("====================== ${CHAPTER_NAME} ==================================")
-  
+
   cmake_parse_arguments(CHAPTER "" "SHADER" "LIBS;TEXTURES;MODELS" ${ARGN})
 
   add_executable(${CHAPTER_NAME} ${CHAPTER_NAME}.cpp)
@@ -188,7 +216,7 @@ add_chapter(28_model_loading
   LIBS glm::glm)
 
 
-  add_chapter(28_1_pipelines
+add_chapter(28_1_pipelines
   SHADER 28_model_loading
   MODELS ../resources/viking_room.obj
   TEXTURES ../resources/viking_room.png
@@ -203,7 +231,7 @@ add_chapter(29_mipmapping
   # TEXTURES ../resources/viking_room.png
   MODELS ../resources/Plane.obj
   TEXTURES ../resources/Plane.png
-  
+
   # LIBS glm::glm tinyobjloader::tinyobjloader)
   LIBS glm::glm)
 

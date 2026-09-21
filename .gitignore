@@ -1,6 +1,11 @@
 *.html
 ads.txt
 build/*
+build_vscode/*
+
+ImageViewer/build/*
+ImageViewer/build_vscode/*
+
 
 **/_out/*
 **/.vscode/*

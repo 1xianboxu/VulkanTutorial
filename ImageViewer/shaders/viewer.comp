@@ -1,0 +1,71 @@
+#version 450
+
+// 双三次（Catmull-Rom）高质量放大
+// 放大超过 1:1 后，图形管线的双线性采样会让画面发虚；
+// 本 pass 直接对主图源纹理做 4x4 双三次卷积重采样，边缘更锐利、锯齿更少。
+// 输出为最终成品图像（不叠加棋盘格）。
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) uniform sampler2D srcImage;                 // 屏幕背景（含双线性主图，用于透传）
+layout(binding = 1, rgba8) uniform writeonly image2D dstImage;  // 输出
+layout(binding = 2) uniform sampler2D srcTexture;               // 主图源纹理（取 LOD 0）
+
+layout(push_constant) uniform PushConstants {
+    float rectX, rectY;  // 主图在屏幕上的显示矩形（帧缓冲像素）
+    float rectW, rectH;
+    float texW, texH;    // 源纹理尺寸
+    float pad0, pad1;
+} pc;
+
+// Catmull-Rom 双三次采样：直接 4x4 texelFetch 卷积（每像素 16 tap）。
+// texelFetch 不做过滤、逐纹素精确读取，不依赖硬件双线性，结果确定无疑。
+vec4 sampleBicubic(sampler2D tex, vec2 uv, ivec2 texSize)
+{
+    vec2 tc = uv * vec2(texSize) - 0.5; // 纹素中心坐标系
+    vec2 f = fract(tc);
+    ivec2 i = ivec2(floor(tc));
+
+    // Catmull-Rom 权重（支撑纹素偏移 -1, 0, +1, +2），四权重和恒为 1
+    vec2 f2 = f * f;
+    vec2 f3 = f2 * f;
+    vec2 w0 = -0.5 * f3 + f2 - 0.5 * f;
+    vec2 w1 =  1.5 * f3 - 2.5 * f2 + 1.0;
+    vec2 w2 = -1.5 * f3 + 2.0 * f2 + 0.5 * f;
+    vec2 w3 =  0.5 * f3 - 0.5 * f;
+    float wx[4] = float[4](w0.x, w1.x, w2.x, w3.x);
+    float wy[4] = float[4](w0.y, w1.y, w2.y, w3.y);
+
+    vec4 sum = vec4(0.0);
+    for (int y = 0; y < 4; y++)
+    {
+        for (int x = 0; x < 4; x++)
+        {
+            ivec2 tp = clamp(i + ivec2(x - 1, y - 1), ivec2(0), texSize - 1);
+            sum += texelFetch(tex, tp, 0) * (wx[x] * wy[y]);
+        }
+    }
+    return sum;
+}
+
+void main()
+{
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = textureSize(srcImage, 0);
+    if (pos.x >= size.x || pos.y >= size.y)
+        return;
+
+    vec4 bg = texelFetch(srcImage, pos, 0);
+
+    // 主图矩形外：透传背景
+    vec2 rel = (vec2(pos) + 0.5 - vec2(pc.rectX, pc.rectY)) / vec2(pc.rectW, pc.rectH);
+    if (rel.x < 0.0 || rel.x > 1.0 || rel.y < 0.0 || rel.y > 1.0)
+    {
+        imageStore(dstImage, pos, bg);
+        return;
+    }
+
+    ivec2 ts = ivec2(int(pc.texW), int(pc.texH));
+    vec4 c = sampleBicubic(srcTexture, rel, ts);
+    imageStore(dstImage, pos, vec4(c.rgb, 1.0));
+}
