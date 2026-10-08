@@ -172,7 +172,20 @@ private:
     float hardness = 0.85f;
     float spacing = 0.12f; // 直径的比例
     DrawTool tool = DrawTool::Pen;
+    uint64_t layerId = 0; // 命令始终回放到创建它时选中的图层
     std::shared_ptr<const AbrBrushTip> brushTip;
+  };
+
+  struct EditLayer {
+    uint64_t id = 0;
+    std::string name;
+    bool isOriginal = false;
+    bool visible = true;
+    float opacity = 1.0f;
+    // basePixels 是撤销/重做回放的起点。普通新图层透明，原图层保存原图，
+    // 复制图层则把复制瞬间的像素作为新的起点。
+    std::vector<uint8_t> basePixels;
+    std::vector<uint8_t> pixels;
   };
 
   struct ImportedBrushTip {
@@ -227,8 +240,8 @@ private:
   double lastClickTime = 0.0;
   double cursorX = WIDTH * 0.5, cursorY = HEIGHT * 0.5;
 
-  // 绘制/标注模式。CPU RGBA 工作画布从原图复制，画笔和橡皮擦都直接
-  // 修改这份副本；橡皮擦降低原图/笔触的 Alpha，透明处显示棋盘格。
+  // 绘制/标注模式。每个图层持有独立 RGBA 像素，editLayerPixels 是所有
+  // 可见图层实时合成后的预览/导出结果；橡皮擦只作用于当前图层。
   bool editMode = false;
   bool editDirty = false;
   bool drawingStroke = false;
@@ -243,6 +256,10 @@ private:
   bool brushUiHovered = false; // 上一帧鼠标是否位于画笔面板或笔尖列表
   std::vector<DrawStroke> drawStrokes;
   size_t drawHistoryCursor = 0; // [0,cursor) 是当前已应用命令
+  std::vector<EditLayer> editLayers; // 从下到上排列
+  int activeEditLayer = 0;
+  uint64_t nextEditLayerId = 1;
+  int nextEditLayerNumber = 2;
   std::vector<uint8_t> editLayerPixels;
   TextureHandle editLayerTex = 0;
   bool editLayerDirty = false;
@@ -784,6 +801,10 @@ private:
     editIndex = -1;
     drawStrokes.clear();
     drawHistoryCursor = 0;
+    editLayers.clear();
+    activeEditLayer = 0;
+    nextEditLayerId = 1;
+    nextEditLayerNumber = 2;
     editLayerPixels.clear();
     if (editLayerTex != 0) {
       renderer.destroyTexture(editLayerTex);
@@ -1011,6 +1032,26 @@ private:
         setEditNotice(u8"原图像素尺寸异常，无法进入绘制模式");
         return;
       }
+      editLayers.clear();
+      nextEditLayerId = 1;
+      nextEditLayerNumber = 2;
+
+      EditLayer original;
+      original.id = nextEditLayerId++;
+      original.name = u8"原图";
+      original.isOriginal = true;
+      original.basePixels = base.pixels;
+      original.pixels = base.pixels;
+      editLayers.push_back(std::move(original));
+
+      EditLayer paint;
+      paint.id = nextEditLayerId++;
+      paint.name = u8"绘制 1";
+      paint.basePixels.assign(base.pixels.size(), 0);
+      paint.pixels = paint.basePixels;
+      editLayers.push_back(std::move(paint));
+      activeEditLayer = 1;
+
       editLayerPixels = base.pixels;
       editLayerTex =
           renderer.createTexture(editLayerPixels.data(), imgW, imgH, false);
@@ -1019,7 +1060,245 @@ private:
     }
     editMode = true;
     uiVisible = true;
-    setEditNotice(u8"已进入绘制模式 · 在图片上拖动鼠标开始标注");
+    setEditNotice(u8"已进入绘制模式 · 已创建独立绘制图层");
+  }
+
+  EditLayer *findEditLayer(uint64_t id) {
+    for (EditLayer &layer : editLayers)
+      if (layer.id == id)
+        return &layer;
+    return nullptr;
+  }
+
+  EditLayer *currentEditLayer() {
+    if (activeEditLayer < 0 || activeEditLayer >= (int)editLayers.size())
+      return nullptr;
+    return &editLayers[(size_t)activeEditLayer];
+  }
+
+  void recomposeEditRegion(int x0, int y0, int x1, int y1) {
+    if (editLayerPixels.size() != (size_t)imgW * imgH * 4 || imgW <= 0 ||
+        imgH <= 0)
+      return;
+    x0 = std::clamp(x0, 0, imgW - 1);
+    y0 = std::clamp(y0, 0, imgH - 1);
+    x1 = std::clamp(x1, 0, imgW - 1);
+    y1 = std::clamp(y1, 0, imgH - 1);
+    if (x0 > x1 || y0 > y1)
+      return;
+
+    for (int y = y0; y <= y1; ++y) {
+      for (int x = x0; x <= x1; ++x) {
+        const size_t offset = ((size_t)y * imgW + x) * 4;
+        float outR = 0.0f, outG = 0.0f, outB = 0.0f, outA = 0.0f;
+        for (const EditLayer &layer : editLayers) {
+          if (!layer.visible || layer.opacity <= 0.0f ||
+              layer.pixels.size() != editLayerPixels.size())
+            continue;
+          const uint8_t *s = layer.pixels.data() + offset;
+          const float sa = (s[3] / 255.0f) *
+                           std::clamp(layer.opacity, 0.0f, 1.0f);
+          if (sa <= 0.0f)
+            continue;
+          const float oa = sa + outA * (1.0f - sa);
+          if (oa > 1e-6f) {
+            outR = ((s[0] / 255.0f) * sa + outR * outA * (1.0f - sa)) / oa;
+            outG = ((s[1] / 255.0f) * sa + outG * outA * (1.0f - sa)) / oa;
+            outB = ((s[2] / 255.0f) * sa + outB * outA * (1.0f - sa)) / oa;
+          }
+          outA = oa;
+        }
+        uint8_t *d = editLayerPixels.data() + offset;
+        d[0] = (uint8_t)std::lround(std::clamp(outR, 0.0f, 1.0f) * 255.0f);
+        d[1] = (uint8_t)std::lround(std::clamp(outG, 0.0f, 1.0f) * 255.0f);
+        d[2] = (uint8_t)std::lround(std::clamp(outB, 0.0f, 1.0f) * 255.0f);
+        d[3] = (uint8_t)std::lround(std::clamp(outA, 0.0f, 1.0f) * 255.0f);
+      }
+    }
+    markLayerDirty(x0, y0, x1, y1);
+  }
+
+  void recomposeWholeImage() {
+    recomposeEditRegion(0, 0, imgW - 1, imgH - 1);
+  }
+
+  void recomposePendingRegion() {
+    if (editLayerDirty && dirtyMaxX >= dirtyMinX && dirtyMaxY >= dirtyMinY) {
+      const int x0 = dirtyMinX, y0 = dirtyMinY, x1 = dirtyMaxX,
+                y1 = dirtyMaxY;
+      // markLayerDirty 会重新并入同一范围，供纹理上传阶段使用。
+      recomposeEditRegion(x0, y0, x1, y1);
+    }
+  }
+
+  void addEditLayer() {
+    if (editLayerPixels.empty())
+      return;
+    if (editLayers.size() >= 32) {
+      setEditNotice(u8"最多支持 32 个图层");
+      return;
+    }
+    EditLayer layer;
+    layer.id = nextEditLayerId++;
+    layer.name = u8"绘制 " + std::to_string(nextEditLayerNumber++);
+    layer.basePixels.assign(editLayerPixels.size(), 0);
+    layer.pixels = layer.basePixels;
+    const int insertAt = std::clamp(activeEditLayer + 1, 0,
+                                    (int)editLayers.size());
+    editLayers.insert(editLayers.begin() + insertAt, std::move(layer));
+    activeEditLayer = insertAt;
+    editDirty = true;
+    setEditNotice(u8"已新建透明图层");
+  }
+
+  void duplicateEditLayer() {
+    EditLayer *source = currentEditLayer();
+    if (!source)
+      return;
+    EditLayer copy = *source;
+    copy.id = nextEditLayerId++;
+    copy.isOriginal = false;
+    copy.name += u8" 副本";
+    copy.basePixels = copy.pixels;
+    const int insertAt = activeEditLayer + 1;
+    editLayers.insert(editLayers.begin() + insertAt, std::move(copy));
+    activeEditLayer = insertAt;
+    recomposeWholeImage();
+    editDirty = true;
+    setEditNotice(u8"已复制图层");
+  }
+
+  void deleteActiveEditLayer() {
+    if (editLayers.size() <= 1 || !currentEditLayer())
+      return;
+    const uint64_t removedId = currentEditLayer()->id;
+    editLayers.erase(editLayers.begin() + activeEditLayer);
+    activeEditLayer = std::clamp(activeEditLayer - 1, 0,
+                                 (int)editLayers.size() - 1);
+
+    std::vector<DrawStroke> kept;
+    kept.reserve(drawStrokes.size());
+    size_t keptCursor = 0;
+    for (size_t i = 0; i < drawStrokes.size(); ++i) {
+      if (drawStrokes[i].layerId == removedId)
+        continue;
+      if (i < drawHistoryCursor)
+        ++keptCursor;
+      kept.push_back(std::move(drawStrokes[i]));
+    }
+    drawStrokes = std::move(kept);
+    drawHistoryCursor = keptCursor;
+    recomposeWholeImage();
+    editDirty = true;
+    setEditNotice(u8"已删除图层");
+  }
+
+  void moveActiveEditLayer(int direction) {
+    const int target = activeEditLayer + direction;
+    if (activeEditLayer < 0 || target < 0 ||
+        target >= (int)editLayers.size())
+      return;
+    std::swap(editLayers[(size_t)activeEditLayer], editLayers[(size_t)target]);
+    activeEditLayer = target;
+    recomposeWholeImage();
+    editDirty = true;
+  }
+
+  void reorderEditLayer(uint64_t draggedId, uint64_t targetId,
+                        bool placeAboveTarget) {
+    if (draggedId == targetId || editLayers.size() < 2)
+      return;
+    int sourceIndex = -1;
+    for (int i = 0; i < (int)editLayers.size(); ++i) {
+      if (editLayers[(size_t)i].id == draggedId) {
+        sourceIndex = i;
+        break;
+      }
+    }
+    if (sourceIndex < 0)
+      return;
+
+    EditLayer moving = std::move(editLayers[(size_t)sourceIndex]);
+    editLayers.erase(editLayers.begin() + sourceIndex);
+    int targetIndex = -1;
+    for (int i = 0; i < (int)editLayers.size(); ++i) {
+      if (editLayers[(size_t)i].id == targetId) {
+        targetIndex = i;
+        break;
+      }
+    }
+    if (targetIndex < 0) {
+      editLayers.insert(editLayers.begin() +
+                            std::min(sourceIndex, (int)editLayers.size()),
+                        std::move(moving));
+      return;
+    }
+    const int insertIndex =
+        targetIndex + (placeAboveTarget ? 1 : 0); // 数组从下到上
+    editLayers.insert(editLayers.begin() + insertIndex, std::move(moving));
+    activeEditLayer = insertIndex;
+    recomposeWholeImage();
+    editDirty = true;
+    setEditNotice(u8"已调整图层顺序");
+  }
+
+  void drawEditLayerThumbnail(const EditLayer &layer, const ImVec2 &topLeft,
+                              float size, bool selected) const {
+    ImDrawList *draw = ImGui::GetWindowDrawList();
+    const ImVec2 bottomRight(topLeft.x + size, topLeft.y + size);
+    draw->AddRectFilled(topLeft, bottomRight, IM_COL32(250, 250, 250, 255),
+                        5.0f);
+    constexpr int checkerCells = 6;
+    const float checker = size / checkerCells;
+    for (int y = 0; y < checkerCells; ++y) {
+      for (int x = 0; x < checkerCells; ++x) {
+        const ImU32 color = ((x + y) & 1) ? IM_COL32(224, 224, 224, 255)
+                                           : IM_COL32(245, 245, 245, 255);
+        draw->AddRectFilled(
+            ImVec2(topLeft.x + x * checker, topLeft.y + y * checker),
+            ImVec2(topLeft.x + (x + 1) * checker,
+                   topLeft.y + (y + 1) * checker),
+            color);
+      }
+    }
+
+    if (imgW > 0 && imgH > 0 &&
+        layer.pixels.size() == (size_t)imgW * imgH * 4) {
+      const float inset = 3.0f;
+      const float available = size - inset * 2.0f;
+      const float imageScale =
+          std::min(available / imgW, available / imgH);
+      const float drawW = std::max(1.0f, imgW * imageScale);
+      const float drawH = std::max(1.0f, imgH * imageScale);
+      const float left = topLeft.x + (size - drawW) * 0.5f;
+      const float top = topLeft.y + (size - drawH) * 0.5f;
+      constexpr int samples = 12;
+      for (int gy = 0; gy < samples; ++gy) {
+        for (int gx = 0; gx < samples; ++gx) {
+          const int sx = std::clamp(
+              (int)((gx + 0.5f) * imgW / samples), 0, imgW - 1);
+          const int sy = std::clamp(
+              (int)((gy + 0.5f) * imgH / samples), 0, imgH - 1);
+          const uint8_t *pixel =
+              layer.pixels.data() + ((size_t)sy * imgW + sx) * 4;
+          if (pixel[3] == 0)
+            continue;
+          const float x0 = left + drawW * gx / samples;
+          const float y0 = top + drawH * gy / samples;
+          const float x1 = left + drawW * (gx + 1) / samples + 0.5f;
+          const float y1 = top + drawH * (gy + 1) / samples + 0.5f;
+          draw->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1),
+                              IM_COL32(pixel[0], pixel[1], pixel[2], pixel[3]));
+        }
+      }
+    }
+    if (!layer.visible)
+      draw->AddRectFilled(topLeft, bottomRight, IM_COL32(248, 248, 248, 150),
+                          5.0f);
+    draw->AddRect(topLeft, bottomRight,
+                  selected ? IM_COL32(64, 174, 235, 255)
+                           : IM_COL32(205, 209, 214, 255),
+                  5.0f, 0, selected ? 2.0f : 1.0f);
   }
 
   void undoDraw() {
@@ -1073,11 +1352,13 @@ private:
     }
   }
 
-  void paintLayerPixel(int x, int y, const DrawStroke &stroke,
+  void paintLayerPixel(EditLayer &layer, int x, int y, const DrawStroke &stroke,
                        float coverage) {
     if (x < 0 || y < 0 || x >= imgW || y >= imgH || coverage <= 0.0f)
       return;
-    uint8_t *d = editLayerPixels.data() + ((size_t)y * imgW + x) * 4;
+    if (layer.pixels.size() != editLayerPixels.size())
+      return;
+    uint8_t *d = layer.pixels.data() + ((size_t)y * imgW + x) * 4;
     const float amount =
         std::clamp(stroke.color[3] * coverage, 0.0f, 1.0f);
     if (stroke.tool == DrawTool::Eraser) {
@@ -1103,7 +1384,8 @@ private:
     d[3] = (uint8_t)std::lround(std::clamp(oa, 0.0f, 1.0f) * 255.0f);
   }
 
-  void stampLayerBrush(const DrawPoint &p, const DrawStroke &stroke) {
+  void stampLayerBrush(EditLayer &layer, const DrawPoint &p,
+                       const DrawStroke &stroke) {
     const float radius = std::max(0.5f, stroke.radius);
     if (stroke.brushTip && stroke.brushTip->width > 0 &&
         stroke.brushTip->height > 0 && !stroke.brushTip->mask.empty()) {
@@ -1143,7 +1425,7 @@ private:
             continue;
           const float u = nx * tip.width - 0.5f;
           const float v = ny * tip.height - 0.5f;
-          paintLayerPixel(x, y, stroke, sampleMask(u, v));
+          paintLayerPixel(layer, x, y, stroke, sampleMask(u, v));
         }
       }
       markLayerDirty(x0, y0, x1, y1);
@@ -1168,14 +1450,15 @@ private:
               (radius + 0.5f - distance) /
                   std::max(0.5f, radius - inner + 0.5f),
               0.0f, 1.0f);
-        paintLayerPixel(x, y, stroke, coverage);
+        paintLayerPixel(layer, x, y, stroke, coverage);
       }
     }
     markLayerDirty(x0, y0, x1, y1);
   }
 
-  void rasterizeStrokeSegment(const DrawStroke &stroke, const DrawPoint &a,
-                              const DrawPoint &b, bool includeStart) {
+  void rasterizeStrokeSegment(EditLayer &layer, const DrawStroke &stroke,
+                              const DrawPoint &a, const DrawPoint &b,
+                              bool includeStart) {
     const float dx = b.x - a.x, dy = b.y - a.y;
     const float length = std::sqrt(dx * dx + dy * dy);
     const float step = std::max(
@@ -1184,42 +1467,38 @@ private:
     const int first = includeStart ? 0 : 1;
     for (int i = first; i <= steps; ++i) {
       const float t = (float)i / steps;
-      stampLayerBrush({a.x + dx * t, a.y + dy * t}, stroke);
+      stampLayerBrush(layer, {a.x + dx * t, a.y + dy * t}, stroke);
     }
   }
 
   void rasterizeStroke(const DrawStroke &stroke) {
+    EditLayer *layer = findEditLayer(stroke.layerId);
+    if (!layer)
+      return;
     if (stroke.tool == DrawTool::Clear) {
-      const auto base = fullCache.find(editIndex);
-      if (base != fullCache.end() &&
-          base->second.pixels.size() == editLayerPixels.size())
-        editLayerPixels = base->second.pixels;
-      else
-        std::fill(editLayerPixels.begin(), editLayerPixels.end(), 0);
+      std::fill(layer->pixels.begin(), layer->pixels.end(), 0);
       markLayerDirty(0, 0, imgW - 1, imgH - 1);
       return;
     }
     if (stroke.points.empty())
       return;
-    stampLayerBrush(stroke.points.front(), stroke);
+    stampLayerBrush(*layer, stroke.points.front(), stroke);
     for (size_t i = 1; i < stroke.points.size(); ++i)
-      rasterizeStrokeSegment(stroke, stroke.points[i - 1], stroke.points[i],
-                             false);
+      rasterizeStrokeSegment(*layer, stroke, stroke.points[i - 1],
+                             stroke.points[i], false);
   }
 
   void rebuildEditLayer() {
-    if (editLayerPixels.empty())
+    if (editLayerPixels.empty() || editLayers.empty())
       return;
-    const auto base = fullCache.find(editIndex);
-    if (base != fullCache.end() &&
-        base->second.pixels.size() == editLayerPixels.size())
-      editLayerPixels = base->second.pixels;
-    else
-      std::fill(editLayerPixels.begin(), editLayerPixels.end(), 0);
-    markLayerDirty(0, 0, imgW - 1, imgH - 1);
+    for (EditLayer &layer : editLayers)
+      layer.pixels = layer.basePixels;
+    editLayerDirty = false;
+    dirtyMaxX = dirtyMaxY = -1;
     const size_t count = std::min(drawHistoryCursor, drawStrokes.size());
     for (size_t i = 0; i < count; ++i)
       rasterizeStroke(drawStrokes[i]);
+    recomposeWholeImage();
   }
 
   void flushEditLayerTexture() {
@@ -1246,6 +1525,13 @@ private:
     DrawPoint p;
     if (!screenToImage(fx, fy, p))
       return;
+    EditLayer *layer = currentEditLayer();
+    if (!layer)
+      return;
+    if (!layer->visible) {
+      layer->visible = true;
+      recomposeWholeImage();
+    }
     drawingStroke = true;
     editDirty = true;
     DrawStroke stroke;
@@ -1256,9 +1542,11 @@ private:
     stroke.hardness = brushHardness;
     stroke.spacing = brushSpacing;
     stroke.tool = drawTool;
+    stroke.layerId = layer->id;
     stroke.brushTip = activeBrushTip;
     appendDrawCommand(std::move(stroke));
     rasterizeStroke(drawStrokes[drawHistoryCursor - 1]);
+    recomposePendingRegion();
   }
 
   void continueDrawInput(float fx, float fy) {
@@ -1270,12 +1558,16 @@ private:
     if (drawHistoryCursor == 0 || drawHistoryCursor > drawStrokes.size())
       return;
     DrawStroke &stroke = drawStrokes[drawHistoryCursor - 1];
+    EditLayer *layer = findEditLayer(stroke.layerId);
+    if (!layer)
+      return;
     const DrawPoint &last = stroke.points.back();
     const float dx = p.x - last.x, dy = p.y - last.y;
     const float minStep = std::max(0.25f, stroke.radius * stroke.spacing * 0.5f);
     if (dx * dx + dy * dy >= minStep * minStep) {
-      rasterizeStrokeSegment(stroke, last, p, false);
+      rasterizeStrokeSegment(*layer, stroke, last, p, false);
       stroke.points.push_back(p);
+      recomposePendingRegion();
     }
   }
 
@@ -1445,7 +1737,8 @@ private:
       return;
     }
 
-    // 绘制模式快捷键：Ctrl+S 保存，Ctrl+Z/Y 撤销/重做。
+    // 绘制模式快捷键：Ctrl+S 保存，Ctrl+Z/Y 撤销/重做，
+    // Ctrl+Shift+N 新建透明图层。
     if (action == GLFW_PRESS && (mods & GLFW_MOD_CONTROL) &&
         editIndex == current) {
       if (key == GLFW_KEY_Z) {
@@ -1461,6 +1754,10 @@ private:
       }
       if (key == GLFW_KEY_S) {
         saveEditedCopy(false);
+        return;
+      }
+      if (key == GLFW_KEY_N && (mods & GLFW_MOD_SHIFT) && editMode) {
+        addEditLayer();
         return;
       }
     }
@@ -1779,10 +2076,12 @@ private:
 
     // === 绘制模式工具面板 ===
     if (editMode && editIndex == current) {
-      const float panelW = 340.0f;
+      const float panelW = 380.0f;
+      const float panelH =
+          std::max(360.0f, std::min(880.0f, (float)winH - 90.0f));
       ImGui::SetNextWindowPos(ImVec2((float)winW - panelW - 16.0f, 74.0f),
                               ImGuiCond_Always);
-      ImGui::SetNextWindowSize(ImVec2(panelW, 502.0f), ImGuiCond_Always);
+      ImGui::SetNextWindowSize(ImVec2(panelW, panelH), ImGuiCond_Always);
       ImGui::SetNextWindowBgAlpha(0.97f);
       ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 14.0f);
       ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.0f, 14.0f));
@@ -1791,7 +2090,8 @@ private:
       ImGui::TextUnformatted(editDirty ? u8"绘制模式  ·  未保存"
                                        : u8"绘制模式");
       ImGui::SetWindowFontScale(1.0f);
-      ImGui::TextDisabled(u8"B 画笔 · E 橡皮 · Esc 退出 · Ctrl+S 保存");
+      ImGui::TextDisabled(
+          u8"B 画笔 · E 橡皮 · Ctrl+Shift+N 新建层 · Ctrl+S 保存");
       ImGui::Spacing();
 
       auto toolButton = [&](const char *label, DrawTool tool) {
@@ -1812,7 +2112,7 @@ private:
       toolButton(u8"橡皮擦", DrawTool::Eraser);
       if (drawTool == DrawTool::Eraser && ImGui::IsItemHovered())
         ImGui::SetTooltip(
-            u8"像 Photoshop 橡皮擦一样擦成透明；原图与笔画都会被擦除");
+            u8"像 Photoshop 一样擦除当前图层；选择原图层即可擦除原图");
 
       ImGui::TextDisabled(u8"颜色");
       ImGui::SameLine(70.0f);
@@ -1914,6 +2214,187 @@ private:
         ImGui::EndCombo();
       }
 
+      ImGui::Spacing();
+      ImGui::Separator();
+      ImGui::SetWindowFontScale(1.05f);
+      ImGui::TextUnformatted(u8"图层");
+      ImGui::SetWindowFontScale(1.0f);
+      ImGui::SameLine();
+      ImGui::TextDisabled("%d", (int)editLayers.size());
+      ImGui::SameLine();
+      ImGui::TextDisabled(u8"· 拖动卡片调整叠放顺序");
+
+      ImGui::PushStyleColor(ImGuiCol_Button,
+                            ImVec4(0.84f, 0.94f, 1.00f, 1.0f));
+      ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                            ImVec4(0.74f, 0.90f, 0.99f, 1.0f));
+      if (ImGui::Button(u8"＋ 新建图层", ImVec2(100, 32)))
+        addEditLayer();
+      ImGui::PopStyleColor(2);
+      ImGui::SameLine();
+      ImGui::BeginDisabled(currentEditLayer() == nullptr);
+      if (ImGui::Button(u8"复制", ImVec2(70, 32)))
+        duplicateEditLayer();
+      ImGui::EndDisabled();
+      ImGui::SameLine();
+      ImGui::BeginDisabled(editLayers.size() <= 1);
+      if (ImGui::Button(u8"删除", ImVec2(70, 32)))
+        deleteActiveEditLayer();
+      ImGui::EndDisabled();
+
+      uint64_t pendingDraggedLayer = 0;
+      uint64_t pendingTargetLayer = 0;
+      bool pendingPlaceAbove = false;
+      ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                            ImVec4(0.975f, 0.980f, 0.985f, 1.0f));
+      ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
+      ImGui::BeginChild("##layerlist", ImVec2(0.0f, 162.0f), true);
+      for (int layerIndex = (int)editLayers.size() - 1; layerIndex >= 0;
+           --layerIndex) {
+        EditLayer &layer = editLayers[(size_t)layerIndex];
+        ImGui::PushID((int)layer.id);
+        const bool selected = layerIndex == activeEditLayer;
+        const ImVec2 rowStart = ImGui::GetCursorScreenPos();
+        const float rowWidth = ImGui::GetContentRegionAvail().x;
+        constexpr float rowHeight = 58.0f;
+        const ImVec2 rowEnd(rowStart.x + rowWidth,
+                            rowStart.y + rowHeight);
+        const bool rowHovered = ImGui::IsMouseHoveringRect(rowStart, rowEnd);
+        if (selected || rowHovered) {
+          ImGui::GetWindowDrawList()->AddRectFilled(
+              rowStart, rowEnd,
+              selected ? IM_COL32(220, 242, 255, 255)
+                       : IM_COL32(239, 246, 250, 255),
+              7.0f);
+          if (selected)
+            ImGui::GetWindowDrawList()->AddRectFilled(
+                rowStart, ImVec2(rowStart.x + 3.0f, rowEnd.y),
+                IM_COL32(48, 169, 232, 255), 7.0f,
+                ImDrawFlags_RoundCornersLeft);
+        }
+
+        ImGui::SetCursorScreenPos(ImVec2(rowStart.x + 8.0f,
+                                         rowStart.y + 18.0f));
+        bool visible = layer.visible;
+        if (ImGui::Checkbox("##visible", &visible)) {
+          layer.visible = visible;
+          recomposeWholeImage();
+          editDirty = true;
+        }
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip(visible ? u8"隐藏图层" : u8"显示图层");
+
+        const ImVec2 thumbPos(rowStart.x + 38.0f, rowStart.y + 7.0f);
+        ImGui::SetCursorScreenPos(thumbPos);
+        ImGui::InvisibleButton("##layerthumb", ImVec2(44.0f, 44.0f));
+        if (ImGui::IsItemClicked())
+          activeEditLayer = layerIndex;
+        drawEditLayerThumbnail(layer, thumbPos, 44.0f, selected);
+        if (ImGui::BeginDragDropSource()) {
+          const uint64_t payloadId = layer.id;
+          ImGui::SetDragDropPayload("IMAGEVIEWER_LAYER", &payloadId,
+                                    sizeof(payloadId));
+          ImGui::TextUnformatted(layer.name.c_str());
+          ImGui::TextDisabled(u8"拖到目标位置调整层级");
+          ImGui::EndDragDropSource();
+        }
+
+        ImGui::SetCursorScreenPos(
+            ImVec2(rowStart.x + 90.0f, rowStart.y + 5.0f));
+        char layerMeta[96];
+        snprintf(layerMeta, sizeof(layerMeta), "%s  ·  %.0f%%",
+                 layer.isOriginal ? u8"原始图像" : u8"绘制图层",
+                 layer.opacity * 100.0f);
+        std::string rowLabel = layer.name + "\n" + layerMeta + "##layerrow";
+        const float handleX = rowEnd.x - 11.0f;
+        for (int dot = -1; dot <= 1; ++dot)
+          ImGui::GetWindowDrawList()->AddCircleFilled(
+              ImVec2(handleX, rowStart.y + rowHeight * 0.5f + dot * 6.0f),
+              1.5f, IM_COL32(145, 154, 163, 210));
+        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
+        if (ImGui::Selectable(rowLabel.c_str(), selected,
+                              ImGuiSelectableFlags_AllowDoubleClick,
+                              ImVec2(std::max(40.0f, rowWidth - 118.0f),
+                                     48.0f)))
+          activeEditLayer = layerIndex;
+        ImGui::PopStyleColor(3);
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip(layer.isOriginal
+                                ? u8"原图图层；选中后橡皮擦可以擦除原图"
+                                : u8"透明绘制图层；画笔和橡皮擦只影响此层");
+        if (ImGui::BeginDragDropSource()) {
+          const uint64_t payloadId = layer.id;
+          ImGui::SetDragDropPayload("IMAGEVIEWER_LAYER", &payloadId,
+                                    sizeof(payloadId));
+          ImGui::TextUnformatted(layer.name.c_str());
+          ImGui::TextDisabled(u8"拖到目标位置调整层级");
+          ImGui::EndDragDropSource();
+        }
+        if (ImGui::BeginDragDropTarget()) {
+          const ImGuiPayload *payload = ImGui::AcceptDragDropPayload(
+              "IMAGEVIEWER_LAYER",
+              ImGuiDragDropFlags_AcceptBeforeDelivery);
+          if (payload && payload->DataSize == sizeof(uint64_t)) {
+            const bool placeAbove = ImGui::GetMousePos().y <
+                                    (rowStart.y + rowHeight * 0.5f);
+            const float lineY = placeAbove ? rowStart.y : rowEnd.y;
+            ImGui::GetWindowDrawList()->AddLine(
+                ImVec2(rowStart.x + 4.0f, lineY),
+                ImVec2(rowEnd.x - 4.0f, lineY),
+                IM_COL32(26, 151, 222, 255), 3.0f);
+            if (payload->IsDelivery()) {
+              pendingDraggedLayer =
+                  *static_cast<const uint64_t *>(payload->Data);
+              pendingTargetLayer = layer.id;
+              pendingPlaceAbove = placeAbove;
+            }
+          }
+          ImGui::EndDragDropTarget();
+        }
+        ImGui::SetCursorScreenPos(
+            ImVec2(rowStart.x, rowStart.y + rowHeight + 4.0f));
+        ImGui::PopID();
+      }
+      ImGui::EndChild();
+      ImGui::PopStyleVar();
+      ImGui::PopStyleColor();
+      if (pendingDraggedLayer != 0 && pendingTargetLayer != 0)
+        reorderEditLayer(pendingDraggedLayer, pendingTargetLayer,
+                         pendingPlaceAbove);
+
+      if (EditLayer *layer = currentEditLayer()) {
+        ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                              ImVec4(0.975f, 0.980f, 0.985f, 1.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
+        ImGui::BeginChild("##layerproperties", ImVec2(0.0f, 92.0f), true,
+                          ImGuiWindowFlags_NoScrollbar |
+                              ImGuiWindowFlags_NoScrollWithMouse);
+        char layerName[128] = {};
+        snprintf(layerName, sizeof(layerName), "%s", layer->name.c_str());
+        ImGui::TextDisabled(u8"名称");
+        ImGui::SameLine(82.0f);
+        ImGui::SetNextItemWidth(208.0f);
+        if (ImGui::InputText("##layername", layerName, sizeof(layerName)))
+          layer->name = layerName;
+        float opacityPercent = layer->opacity * 100.0f;
+        ImGui::TextDisabled(u8"不透明度");
+        ImGui::SameLine(82.0f);
+        ImGui::SetNextItemWidth(208.0f);
+        if (ImGui::SliderFloat("##layeropacity", &opacityPercent, 0.0f, 100.0f,
+                               "%.0f%%")) {
+          layer->opacity = opacityPercent / 100.0f;
+          recomposeWholeImage();
+          editDirty = true;
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+      }
+      ImGui::TextDisabled(u8"保存 PNG 时仅合并当前可见图层");
+      ImGui::Spacing();
+
       ImGui::BeginDisabled(drawHistoryCursor == 0);
       if (ImGui::Button(u8"撤销", ImVec2(70, 32)))
         undoDraw();
@@ -1924,16 +2405,18 @@ private:
         redoDraw();
       ImGui::EndDisabled();
       ImGui::SameLine();
-      ImGui::BeginDisabled(drawHistoryCursor == 0);
-      if (ImGui::Button(u8"还原", ImVec2(70, 32))) {
+      ImGui::BeginDisabled(currentEditLayer() == nullptr);
+      if (ImGui::Button(u8"清空层", ImVec2(70, 32))) {
         DrawStroke clearCommand;
         clearCommand.tool = DrawTool::Clear;
+        clearCommand.layerId = currentEditLayer()->id;
         appendDrawCommand(std::move(clearCommand));
         rasterizeStroke(drawStrokes[drawHistoryCursor - 1]);
+        recomposePendingRegion();
         editDirty = true;
       }
       if (ImGui::IsItemHovered())
-        ImGui::SetTooltip(u8"恢复进入绘制时的原图（可撤销）");
+        ImGui::SetTooltip(u8"清空当前图层（可撤销）");
       ImGui::EndDisabled();
 
       if (ImGui::Button(u8"导入画笔", ImVec2(116.0f, 32.0f)))
