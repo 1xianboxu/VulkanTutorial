@@ -8,6 +8,7 @@ layout(push_constant) uniform PushConstants {
     float checker;
     float blend;
     float rotDeg;
+    float sharpUpscale;
 } pc;
 
 layout(location = 0) in vec2 inPosition;

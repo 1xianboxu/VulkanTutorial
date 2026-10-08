@@ -25,6 +25,8 @@ struct Quad {
   float rotDeg = 0.0f;                  // UV 旋转（0/90/180/270）
   bool checker = false; // 是否按 alpha 混合棋盘格背景（看透明图用）
   bool blend = false;   // true=按 alpha 与背景混合（文字等半透明贴片用）
+  // 0=普通采样；>1=实际放大倍率，用于保持约 1 屏幕像素的边缘过渡。
+  float sharpUpscale = 0.0f;
 };
 
 class VulkanImageRenderer {
@@ -44,6 +46,12 @@ public:
   // std::runtime_error。
   TextureHandle createTexture(const void *rgba, int width, int height,
                               bool mipmaps);
+
+  // 更新无 mipmap RGBA8 纹理的局部区域。rgba 指向完整源图，sourceStrideBytes
+  // 是源图每行字节数；用于绘制层每帧只上传发生变化的小块区域。
+  bool updateTextureRegion(TextureHandle tex, int x, int y, int width,
+                           int height, const void *rgba,
+                           int sourceStrideBytes);
 
   // 延迟销毁：等 GPU 不再使用后回收（在 drawFrame 中自动清理）
   void destroyTexture(TextureHandle tex);
@@ -70,6 +78,7 @@ public:
     TextureHandle source = 0;         // 需要高质量放大的源纹理（主图）
     float srcW = 0, srcH = 0;         // 源纹理尺寸
     float x = 0, y = 0, w = 0, h = 0; // 源纹理在屏幕上的显示矩形（帧缓冲像素）
+    float rotDeg = 0;                 // 与主图一致的 UV 旋转
   };
   void setPostProcess(const PostParams &p) { post = p; }
 

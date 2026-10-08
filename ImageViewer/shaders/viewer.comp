@@ -15,12 +15,15 @@ layout(push_constant) uniform PushConstants {
     float rectX, rectY;  // 主图在屏幕上的显示矩形（帧缓冲像素）
     float rectW, rectH;
     float texW, texH;    // 源纹理尺寸
-    float pad0, pad1;
+    float rotDeg;        // 与图形管线一致的 UV 旋转
+    float pad0;
 } pc;
 
 // Catmull-Rom 双三次采样：直接 4x4 texelFetch 卷积（每像素 16 tap）。
 // texelFetch 不做过滤、逐纹素精确读取，不依赖硬件双线性，结果确定无疑。
-vec4 sampleBicubic(sampler2D tex, vec2 uv, ivec2 texSize)
+// 在卷积前转为预乘 Alpha。PNG 的全透明像素仍可能保存任意 RGB；若直接
+// 插值，这些本应不可见的颜色会在透明边缘形成黑边、红边或条纹。
+vec4 sampleBicubicPremultiplied(sampler2D tex, vec2 uv, ivec2 texSize)
 {
     vec2 tc = uv * vec2(texSize) - 0.5; // 纹素中心坐标系
     vec2 f = fract(tc);
@@ -42,10 +45,17 @@ vec4 sampleBicubic(sampler2D tex, vec2 uv, ivec2 texSize)
         for (int x = 0; x < 4; x++)
         {
             ivec2 tp = clamp(i + ivec2(x - 1, y - 1), ivec2(0), texSize - 1);
-            sum += texelFetch(tex, tp, 0) * (wx[x] * wy[y]);
+            vec4 tap = texelFetch(tex, tp, 0);
+            tap.rgb *= tap.a;
+            sum += tap * (wx[x] * wy[y]);
         }
     }
-    return sum;
+
+    // Catmull-Rom 含负权重，透明边缘可能产生轻微过冲；限制到合法的
+    // 预乘颜色范围，防止放大后出现亮边。
+    sum.a = clamp(sum.a, 0.0, 1.0);
+    sum.rgb = clamp(sum.rgb, vec3(0.0), vec3(sum.a));
+    return sum; // rgb 保持预乘，稍后可直接做 over 合成
 }
 
 void main()
@@ -65,7 +75,23 @@ void main()
         return;
     }
 
+    // 与 viewer.vert 完全相同的 UV 旋转，确保高清放大在旋转后不会弹回原图。
+    if (pc.rotDeg != 0.0)
+    {
+        float r = radians(pc.rotDeg);
+        float cs = cos(r), sn = sin(r);
+        vec2 center = vec2(0.5);
+        rel = center + (rel - center) * mat2(cs, -sn, sn, cs);
+    }
+
     ivec2 ts = ivec2(int(pc.texW), int(pc.texH));
-    vec4 c = sampleBicubic(srcTexture, rel, ts);
-    imageStore(dstImage, pos, vec4(c.rgb, 1.0));
+    vec4 c = sampleBicubicPremultiplied(srcTexture, rel, ts);
+
+    // 高清路径也要保留透明语义。这里重新生成与普通片元路径一致的浅色
+    // 棋盘格，再用预乘 Alpha 合成，不能直接把 c.rgb 当作不透明颜色输出。
+    vec2 cell = floor((vec2(pos) + 0.5) / 8.0);
+    float checker = mod(cell.x + cell.y, 2.0);
+    vec3 checkerColor = mix(vec3(0.78), vec3(0.90), checker);
+    vec3 composed = c.rgb + checkerColor * (1.0 - c.a);
+    imageStore(dstImage, pos, vec4(composed, 1.0));
 }

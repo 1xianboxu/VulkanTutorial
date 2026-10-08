@@ -52,6 +52,7 @@ add_custom_target(shaders DEPENDS
 set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/third_party/imgui)
 add_executable(ImageViewer
   main.cpp
+  renderer/AbrBrushLoader.cpp
   renderer/VulkanImageRenderer.cpp
   renderer/PlatformDialogs.cpp
   ${IMGUI_DIR}/imgui.cpp
@@ -60,6 +61,10 @@ add_executable(ImageViewer
   ${IMGUI_DIR}/imgui_widgets.cpp
   ${IMGUI_DIR}/backends/imgui_impl_glfw.cpp
   ${IMGUI_DIR}/backends/imgui_impl_vulkan.cpp)
+
+if(WIN32)
+  target_sources(ImageViewer PRIVATE ImageViewer.rc)
+endif()
 
 set_target_properties(ImageViewer PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
@@ -79,7 +84,21 @@ add_dependencies(ImageViewer shaders)
 if(WIN32)
   # /utf-8：源码含中文/Unicode 字面量；comdlg32/ole32/gdi32 用于打开对话框与 GDI
   target_compile_options(ImageViewer PRIVATE /utf-8)
-  target_link_libraries(ImageViewer comdlg32 ole32 gdi32)
+  target_link_libraries(ImageViewer comdlg32 ole32 gdi32 windowscodecs)
+
+  add_executable(ImageViewerSavePngTest EXCLUDE_FROM_ALL
+    tests/save_png_test.cpp
+    renderer/PlatformDialogs.cpp)
+  target_include_directories(ImageViewerSavePngTest PRIVATE ${CMAKE_SOURCE_DIR})
+  target_compile_options(ImageViewerSavePngTest PRIVATE /utf-8)
+  target_link_libraries(ImageViewerSavePngTest PRIVATE
+    comdlg32 ole32 windowscodecs)
+
+  add_executable(ImageViewerAbrLoaderTest EXCLUDE_FROM_ALL
+    tests/abr_loader_test.cpp
+    renderer/AbrBrushLoader.cpp)
+  target_include_directories(ImageViewerAbrLoaderTest PRIVATE ${CMAKE_SOURCE_DIR})
+  target_compile_options(ImageViewerAbrLoaderTest PRIVATE /utf-8)
 endif()
 
 # Windows Shell 缩略图 Handler（COM DLL，与 exe 同目录）
